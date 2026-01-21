@@ -1,109 +1,59 @@
 import serial
 import pynmea2
 import time
-import math
-from datetime import datetime
 
-# ===== CONFIG =====
-SERIAL_PORT = "/dev/serial0"
-BAUDRATE = 9600
-LOG_INTERVAL = 1  # seconds
-CSV_FILE = None
+GPS_PORT = "/dev/ttyAMA0"
+GPS_BAUD = 57600  # Default HGLRC 100 Pro
+TIMEOUT = 1
 
-# ===== STATE =====
-start_logging = False
-start_lat = None
-start_lon = None
-prev_lat = None
-prev_lon = None
-total_distance = 0.0
-max_speed = 0.0
-last_log_time = 0
-status = "w8-4-fix"
+# UBX CFG-PRT para activar NMEA+UBX
+CFG_PRT = bytes([
+    0xB5, 0x62, 0x06, 0x00, 0x14, 0x00, 
+    0x01, 0x00, 0x00, 0x00, 0xD0, 0x08, 0x00, 0x00,
+    0x80, 0x25, 0x00, 0x00, 0x07, 0x00, 0x03, 0x00, 0x00, 0x00
+])
 
-# ===== HELPERS =====
-def haversine(lat1, lon1, lat2, lon2):
-    R = 6371000  # meters
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
+# Calcular checksum UBX
+def ubx_checksum(msg):
+    ck_a = 0
+    ck_b = 0
+    for b in msg[2:len(msg)]:
+        ck_a = (ck_a + b) & 0xFF
+        ck_b = (ck_b + ck_a) & 0xFF
+    return bytes([ck_a, ck_b])
 
-    a = math.sin(dphi/2)**2 + \
-        math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2
-    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+CFG_PRT += ubx_checksum(CFG_PRT)
 
-def start_new_log():
-    global CSV_FILE, start_logging
-    ts = datetime.utcnow().strftime("%d%m_H%H%M")
-    CSV_FILE = f"{ts}.csv"
-    with open(CSV_FILE, "w") as f:
-        f.write("lat,lon,alt,speed_kmh,time,total_dist,start_dist\n")
-    start_logging = True
-    print(f"[LOG] Started: {CSV_FILE}")
+# Abrir UART
+ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=TIMEOUT, bytesize=8, parity='N', stopbits=1)
+time.sleep(1)
+ser.reset_input_buffer()
 
-# ===== MAIN =====
-ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=1)
+# Enviar comando UBX
+ser.write(CFG_PRT)
+print("UBX enviado para activar NMEA+UBX, espera 2s...")
+time.sleep(2)
 
-print("GPS logger running… waiting for fix")
-
+# Leer datos NMEA legibles
+print("Leyendo GPS (CTRL+C para salir)...")
 while True:
     try:
-        line = ser.readline().decode("ascii", errors="ignore").strip()
-        if not line.startswith("$"):
+        line = ser.readline().decode('ascii', errors='replace').strip()
+        if not line:
             continue
-
-        msg = pynmea2.parse(line)
-
-        if isinstance(msg, pynmea2.types.talker.GGA):
-            if msg.latitude and msg.longitude:
-                lat = msg.latitude
-                lon = msg.longitude
-                alt = float(msg.altitude) if msg.altitude else 0.0
-                status = "rdy"
-
-                if not start_logging:
-                    start_lat = lat
-                    start_lon = lon
-                    prev_lat = lat
-                    prev_lon = lon
-                    start_new_log()
-
-        if isinstance(msg, pynmea2.types.talker.RMC):
-            if msg.spd_over_grnd is None:
+        if line.startswith('$'):
+            try:
+                msg = pynmea2.parse(line)
+                if isinstance(msg, pynmea2.GGA):
+                    fix = "Fix" if msg.gps_qual > 0 else "Waiting for fix"
+                    print(f"{fix} | Lat: {msg.latitude} {msg.lat_dir}, Lon: {msg.longitude} {msg.lon_dir}, Alt: {msg.altitude} {msg.altitude_units}, Sat: {msg.num_sats}")
+                elif isinstance(msg, pynmea2.RMC):
+                    speed_kmh = float(msg.spd_over_grnd) * 1.852 if msg.spd_over_grnd else 0
+                    print(f"Speed: {speed_kmh:.1f} km/h | Date: {msg.datestamp}, Time: {msg.timestamp}")
+            except pynmea2.ParseError:
                 continue
-
-            speed_kmh = float(msg.spd_over_grnd) * 1.852
-            max_speed = max(max_speed, speed_kmh)
-
-            now = time.time()
-            if now - last_log_time >= LOG_INTERVAL and start_logging:
-                dist_start = haversine(start_lat, start_lon, lat, lon)
-                step_dist = haversine(prev_lat, prev_lon, lat, lon)
-
-                if 5 <= step_dist < 100:
-                    total_distance += step_dist
-                    prev_lat = lat
-                    prev_lon = lon
-
-                with open(CSV_FILE, "a") as f:
-                    f.write(
-                        f"{lat},{lon},{alt},{speed_kmh:.2f},"
-                        f"{datetime.utcnow().isoformat()},"
-                        f"{int(total_distance)},"
-                        f"{int(dist_start)}\n"
-                    )
-
-                last_log_time = now
-
-                print(
-                    f"[GPS] {speed_kmh:.1f} km/h | "
-                    f"TD: {int(total_distance)} m | "
-                    f"SD: {int(dist_start)} m"
-                )
-
-    except pynmea2.ParseError:
-        continue
     except KeyboardInterrupt:
-        print("\nStopping logger")
+        print("Saliendo...")
         break
+
+ser.close()
